@@ -1,300 +1,212 @@
 /**
- * GuardCardCheck — Auth Routes
- *
- * POST /api/auth/register   — Create account + Stripe customer
- * POST /api/auth/login      — Login, return JWT
- * GET  /api/auth/me         — Return current user + plan info
- * POST /api/auth/logout     — Clear cookie
+ * GuardCardCheck — Auth & Plan Middleware
  */
 
-const express = require('express');
-const router = express.Router();
-const bcrypt = require('bcryptjs');
-const { authMiddleware, signToken } = require('../middleware/auth');
-const { createCustomer } = require('../services/stripe');
+const jwt = require('jsonwebtoken');
 const { getPlan } = require('../config/plans');
 
-// ─────────────────────────────────────────────────────────────
-// Register
-// ─────────────────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET;
 
-/**
- * POST /api/auth/register
- * Body: { email, password, firstName, lastName, organizationName }
- *
- * Flow:
- *   1. Validate input
- *   2. Hash password
- *   3. Create Stripe customer (so checkout works immediately)
- *   4. Insert user into DB
- *   5. Return JWT
- */
-router.post('/register', async (req, res) => {
-  const { email, password, firstName, lastName, organizationName } = req.body;
-  const db = req.app.get('db');
-
-  // Validate
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+function authMiddleware(req, res, next) {
+  const token = extractToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required. Please log in.' });
   }
-  if (password.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-  }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: 'Invalid email address.' });
-  }
-
-  const client = await db.connect();
   try {
-    await client.query('BEGIN');
-
-    // Check email uniqueness
-    const existing = await client.query(
-      'SELECT id FROM users WHERE email = $1',
-      [email.toLowerCase().trim()]
-    );
-    if (existing.rows.length) {
-      return res.status(409).json({ error: 'An account with that email already exists.' });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Session expired. Please log in again.', code: 'TOKEN_EXPIRED' });
     }
+    return res.status(401).json({ error: 'Invalid authentication token.' });
+  }
+}
 
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    // Create Stripe customer first (so we have the ID for the user row)
-    let stripeCustomerId = null;
+function optionalAuth(req, res, next) {
+  const token = extractToken(req);
+  if (token) {
     try {
-      const customer = await createCustomer({
-        email: email.toLowerCase().trim(),
-        name: `${firstName || ''} ${lastName || ''}`.trim() || email,
-        organizationName,
-        userId: 'pending', // will update after insert
+      req.user = jwt.verify(token, JWT_SECRET);
+    } catch {
+      req.user = null;
+    }
+  }
+  next();
+}
+
+function requirePlan(minPlan) {
+  const planOrder = ['free', 'starter', 'business', 'enterprise'];
+  const minIndex = planOrder.indexOf(minPlan);
+
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+
+    const userPlan = req.user.plan || 'free';
+    const userIndex = planOrder.indexOf(userPlan);
+
+    if (userIndex < minIndex) {
+      const planConfig = getPlan(minPlan);
+      return res.status(403).json({
+        error: `This feature requires a ${planConfig.name} plan or higher.`,
+        requiredPlan: minPlan,
+        currentPlan: userPlan,
+        upgradeUrl: `https://guardcardcheck.com/checkout/${minPlan}`,
       });
-      stripeCustomerId = customer.id;
-    } catch (stripeErr) {
-      console.warn('[Auth] Stripe customer creation failed (non-fatal):', stripeErr.message);
-      // Continue — user can still register; billing will create customer on first checkout
     }
 
-    // Create organization if name provided
-    let orgId = null;
-    if (organizationName) {
-      const slug = organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 100)
-        + '-' + Date.now().toString(36);
-      const orgResult = await client.query(
-        'INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id',
-        [organizationName, slug]
+    next();
+  };
+}
+
+function checkUsageLimit(db) {
+  return async (req, res, next) => {
+    if (!req.user) return next();
+
+    const { id: userId, plan } = req.user;
+    const planConfig = getPlan(plan);
+
+    if (plan === 'free') {
+      const { rows } = await db.query(
+        `SELECT daily_searches, last_search_at FROM usage_stats
+         WHERE user_id = $1 AND month_year = TO_CHAR(NOW(), 'YYYY-MM')`,
+        [userId]
       );
-      orgId = orgResult.rows[0].id;
+      const usage = rows[0];
+      const isNewDay = !usage?.last_search_at ||
+        new Date(usage.last_search_at).toDateString() !== new Date().toDateString();
+      const dailyCount = isNewDay ? 0 : (usage?.daily_searches || 0);
+
+      if (dailyCount >= 1) {
+        return res.status(429).json({
+          error: 'Daily search limit reached for Free plan.',
+          limit: 1,
+          used: dailyCount,
+          resetsAt: 'Tomorrow at midnight',
+          upgradeUrl: 'https://guardcardcheck.com/checkout/starter',
+        });
+      }
+      return next();
     }
 
-    // Insert user
-    const userResult = await client.query(`
-      INSERT INTO users (
-        email, password_hash, first_name, last_name,
-        organization_id, stripe_customer_id, plan, role
-      ) VALUES ($1, $2, $3, $4, $5, $6, 'free', 'owner')
-      RETURNING id, email, first_name, last_name, plan, role, stripe_customer_id, created_at
-    `, [
-      email.toLowerCase().trim(),
-      passwordHash,
-      firstName || null,
-      lastName || null,
-      orgId,
-      stripeCustomerId,
-    ]);
-
-    const user = userResult.rows[0];
-
-    // Update Stripe customer metadata with real userId
-    if (stripeCustomerId) {
-      const { stripe } = require('../services/stripe');
-      stripe.customers.update(stripeCustomerId, {
-        metadata: { userId: user.id, organizationName },
-      }).catch(() => {});
+    if (!planConfig.limits.searchesPerMonth) {
+      return next(); // unlimited
     }
 
-    // Initialize usage stats
-    await client.query(`
-      INSERT INTO usage_stats (user_id, month_year) 
-      VALUES ($1, TO_CHAR(NOW(), 'YYYY-MM'))
-      ON CONFLICT DO NOTHING
-    `, [user.id]);
+    const { rows } = await db.query(
+      `SELECT COALESCE(monthly_searches, 0) AS monthly_searches 
+       FROM usage_stats
+       WHERE user_id = $1 AND month_year = TO_CHAR(NOW(), 'YYYY-MM')`,
+      [userId]
+    );
+    const monthlyUsed = rows[0]?.monthly_searches || 0;
 
-    await client.query('COMMIT');
+    if (monthlyUsed >= planConfig.limits.searchesPerMonth) {
+      return res.status(429).json({
+        error: `Monthly search limit reached for ${planConfig.name} plan.`,
+        limit: planConfig.limits.searchesPerMonth,
+        used: monthlyUsed,
+        resetsAt: 'First of next month',
+        upgradeUrl: `https://guardcardcheck.com/pricing`,
+      });
+    }
 
-    const token = signToken({ ...user, stripeCustomerId });
+    req.monthlyUsed = monthlyUsed;
+    next();
+  };
+}
 
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-    });
+function apiKeyAuth(db) {
+  return async (req, res, next) => {
+    // First try JWT
+    const jwtToken = extractToken(req);
+    if (jwtToken) {
+      try {
+        req.user = jwt.verify(jwtToken, JWT_SECRET);
+        if (req.user.plan === 'enterprise') return next();
+      } catch {}
+    }
 
-    res.status(201).json({
-      user: {
-        id: user.id,
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        plan: user.plan,
-        role: user.role,
-      },
-      token,
-    });
+    // Then try API key
+    const apiKey = req.headers['x-api-key'] ||
+      req.headers['authorization']?.replace('Bearer gcc_', '');
 
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('[Auth] Registration error:', error.message);
-    res.status(500).json({ error: 'Registration failed. Please try again.' });
-  } finally {
-    client.release();
-  }
-});
+    if (!apiKey) {
+      return res.status(401).json({ error: 'API key required for this endpoint.' });
+    }
 
-// ─────────────────────────────────────────────────────────────
-// Login
-// ─────────────────────────────────────────────────────────────
+    const crypto = require('crypto');
+    const keyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
 
-/**
- * POST /api/auth/login
- * Body: { email, password }
- */
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  const db = req.app.get('db');
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
-  }
-
-  try {
     const { rows } = await db.query(`
-      SELECT u.*, o.name AS organization_name
-      FROM users u
-      LEFT JOIN organizations o ON o.id = u.organization_id
-      WHERE u.email = $1
-    `, [email.toLowerCase().trim()]);
-
-    const user = rows[0];
-
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid email or password.' });
-    }
-
-    const passwordMatch = await bcrypt.compare(password, user.password_hash);
-    if (!passwordMatch) {
-      return res.status(401).json({ error: 'Invalid email or password.' });
-    }
-
-    // Update last login
-    db.query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]).catch(() => {});
-
-    const token = signToken({
-      id: user.id,
-      email: user.email,
-      plan: user.plan,
-      organization_id: user.organization_id,
-      role: user.role,
-      stripeCustomerId: user.stripe_customer_id,
-    });
-
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000,
-    });
-
-    res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        plan: user.plan,
-        planName: getPlan(user.plan).name,
-        organizationName: user.organization_name,
-        role: user.role,
-        subscriptionStatus: user.subscription_status,
-      },
-      token,
-    });
-
-  } catch (error) {
-    console.error('[Auth] Login error:', error.message);
-    res.status(500).json({ error: 'Login failed. Please try again.' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// Me
-// ─────────────────────────────────────────────────────────────
-
-/**
- * GET /api/auth/me
- * Returns current user profile + plan details
- */
-router.get('/me', authMiddleware, async (req, res) => {
-  const db = req.app.get('db');
-
-  try {
-    const { rows } = await db.query(`
-      SELECT u.id, u.email, u.first_name, u.last_name, u.plan, u.role,
-             u.subscription_status, u.billing_interval, u.plan_expires_at,
-             u.stripe_customer_id, u.created_at,
-             o.name AS organization_name,
-             COALESCE(us.monthly_searches, 0) AS monthly_searches,
-             COALESCE(us.total_searches, 0) AS total_searches
-      FROM users u
-      LEFT JOIN organizations o ON o.id = u.organization_id
-      LEFT JOIN usage_stats us ON us.user_id = u.id 
-        AND us.month_year = TO_CHAR(NOW(), 'YYYY-MM')
-      WHERE u.id = $1
-    `, [req.user.id]);
+      SELECT ak.id, ak.user_id, u.plan, u.organization_id, u.subscription_status
+      FROM api_keys ak
+      JOIN users u ON u.id = ak.user_id
+      WHERE ak.key_hash = $1
+        AND ak.revoked_at IS NULL
+        AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+    `, [keyHash]);
 
     if (!rows.length) {
-      return res.status(404).json({ error: 'User not found.' });
+      return res.status(401).json({ error: 'Invalid or expired API key.' });
     }
 
-    const user = rows[0];
-    const planConfig = getPlan(user.plan);
+    const keyRecord = rows[0];
 
-    res.json({
+    if (keyRecord.plan !== 'enterprise') {
+      return res.status(403).json({
+        error: 'API access requires an Enterprise plan.',
+        upgradeUrl: 'https://guardcardcheck.com/checkout/enterprise',
+      });
+    }
+
+    if (keyRecord.subscription_status !== 'active') {
+      return res.status(403).json({ error: 'Subscription is not active.' });
+    }
+
+    // Update last_used_at (non-blocking)
+    db.query('UPDATE api_keys SET last_used_at = NOW() WHERE id = $1', [keyRecord.id]).catch(() => {});
+
+    req.user = {
+      id: keyRecord.user_id,
+      plan: keyRecord.plan,
+      organizationId: keyRecord.organization_id,
+      apiKeyId: keyRecord.id,
+      authMethod: 'api_key',
+    };
+
+    next();
+  };
+}
+
+function extractToken(req) {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith('Bearer ')) return auth.slice(7);
+  return req.cookies?.token || null;
+}
+
+function signToken(user) {
+  return jwt.sign(
+    {
       id: user.id,
       email: user.email,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      organizationName: user.organization_name,
-      role: user.role,
       plan: user.plan,
-      planName: planConfig.name,
-      planLimits: planConfig.limits,
-      subscriptionStatus: user.subscription_status,
-      billingInterval: user.billing_interval,
-      planExpiresAt: user.plan_expires_at,
-      usage: {
-        monthlySearches: user.monthly_searches,
-        monthlyLimit: planConfig.limits.searchesPerMonth,
-        totalSearches: user.total_searches,
-      },
-      hasStripe: !!user.stripe_customer_id,
-      createdAt: user.created_at,
-    });
+      organizationId: user.organization_id,
+      role: user.role,
+    },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
 
-  } catch (error) {
-    console.error('[Auth] /me error:', error.message);
-    res.status(500).json({ error: 'Failed to load profile.' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// Logout
-// ─────────────────────────────────────────────────────────────
-
-router.post('/logout', (req, res) => {
-  res.clearCookie('token');
-  res.json({ success: true });
-});
-
-module.exports = router;
+module.exports = {
+  authMiddleware,
+  optionalAuth,
+  requirePlan,
+  checkUsageLimit,
+  apiKeyAuth,
+  signToken,
+};
